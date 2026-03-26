@@ -4,7 +4,7 @@ A simple tool for labeling surgical phases in videos. Runs locally on your machi
 
 ---
 
-## Installation (do this once)
+## Installation (only done once)
 
 ### Step 1 — Install Python
 If you don't have Python installed, download it from https://www.python.org/downloads/  
