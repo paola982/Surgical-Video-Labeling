@@ -142,7 +142,7 @@ div[data-testid="stSelectbox"] > div > div {
 </style>
 """, unsafe_allow_html=True)
 
-# -- Phases -- edit this list to match your study ------------------------------
+# -- Phases --------------------------------
 SURGICAL_PHASES = [
     "Splenic flexure / left colon mobilization",
     "Abdominal Posterior Mesorectal Dissection",
@@ -151,6 +151,7 @@ SURGICAL_PHASES = [
     "Lymphadenectomy & Arterial Ligation",
     "Resection and Anastomosis",
     "Idle",
+    "Exception",
 ]
 
 # -- Helpers -------------------------------------------------------------------
@@ -167,7 +168,7 @@ def start_video_server(directory, port=8765):
 
 
 def seconds_to_hms(s: float) -> str:
-    """Convert seconds to HH:MM:SS.mmm string."""
+    """Convert seconds to MM:SS.mmm or HH:MM:SS.mmm string."""
     ms = round((s % 1) * 1000)
     s = int(s)
     h, rem = divmod(s, 3600)
@@ -179,32 +180,24 @@ def seconds_to_hms(s: float) -> str:
 
 def hms_to_seconds(hms: str) -> float:
     """
-    Accept any of these formats:
-      MM:SS
-      MM:SS.mmm
-      HH:MM:SS
-      HH:MM:SS.mmm
-      plain seconds (e.g. 83.5)
+    Accept any of:
+      MM:SS  |  MM:SS.mmm  |  HH:MM:SS  |  HH:MM:SS.mmm  |  plain seconds
     Returns -1.0 on parse failure.
     """
     hms = hms.strip()
     try:
         parts = hms.split(":")
         if len(parts) == 1:
-            # plain seconds, possibly with decimal
             return float(parts[0])
         elif len(parts) == 2:
-            # MM:SS or MM:SS.mmm
             return int(parts[0]) * 60 + float(parts[1])
         else:
-            # HH:MM:SS or HH:MM:SS.mmm
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
     except ValueError:
         return -1.0
 
 
 def clean_path(folder: str) -> str:
-    """Strip hidden unicode chars that appear when copy-pasting Windows paths."""
     return folder.strip().strip(
         "\u202a\u202b\u200b\u200e\u200f\ufeff"
     ).replace("\\", "/")
@@ -265,25 +258,6 @@ def export_all_csv(save_dir: str, video_files: list):
 # -- Session state init --------------------------------------------------------
 if "video_idx" not in st.session_state:
     st.session_state.video_idx = 0
-if "captured_start" not in st.session_state:
-    st.session_state.captured_start = ""
-if "captured_end" not in st.session_state:
-    st.session_state.captured_end = ""
-
-# -- Read captured timestamps from URL hash ------------------------------------
-# The iframe writes "start:<t>" or "end:<t>" to window.parent.location.hash.
-# Streamlit exposes this via st.query_params.
-params = st.query_params
-if "capture" in params:
-    val = params["capture"]          # e.g. "start:83.521" or "end:225.000"
-    if val.startswith("start:"):
-        st.session_state.captured_start = val[6:]
-        st.query_params.clear()
-        st.rerun()
-    elif val.startswith("end:"):
-        st.session_state.captured_end = val[4:]
-        st.query_params.clear()
-        st.rerun()
 
 # -- Sidebar -------------------------------------------------------------------
 with st.sidebar:
@@ -325,7 +299,7 @@ with st.sidebar:
         for i, vf in enumerate(video_files):
             anns = load_annotations(vf, save_dir)
             status = f"done ({len(anns)} phases)" if anns else "not started"
-            marker = "**to**" if i == st.session_state.video_idx else "&nbsp;&nbsp;&nbsp;"
+            marker = "**→**" if i == st.session_state.video_idx else "&nbsp;&nbsp;&nbsp;"
             st.markdown(
                 f"<small>{marker} <code>{vf.name[:28]}</code><br>"
                 f"&nbsp;&nbsp;&nbsp;&nbsp;{status}</small>",
@@ -374,10 +348,11 @@ if not video_files:
     <strong>Getting started:</strong><br>
     1. Enter the path to your video folder in the sidebar<br>
     2. Select a video to annotate<br>
-    3. Pause the video at the start of a phase and click <em>Capture start time</em>,
-       then do the same at the end and click <em>Capture end time</em><br>
+    3. Pause the video and click <em>Copy current time</em> to copy the timestamp,
+       then paste it into the Start time or End time field<br>
     4. Select the phase, add any notes, and click <em>Add Phase</em><br>
-    5. Export all annotations as CSV when done
+    5. The annotations automatically save into a JSON file            
+    6. Export all annotations as CSV when done
     </div>
     """, unsafe_allow_html=True)
     st.stop()
@@ -409,54 +384,70 @@ st.markdown(
 st.markdown("""
 <div class="instructions">
 <strong>How to annotate:</strong> &nbsp;
-Pause the video at the start of a phase and click <em>Capture start time</em>,
-then scrub to the end and click <em>Capture end time</em>.
+Pause the video at the start of a phase and click <em>Copy current time</em>, this
+will copy the timestamp to your clipboard. Paste it (<code>Ctrl+V</code>) into the
+Start time field. Then navigate to the end of the phase and repeat for End time.
 You can also type timestamps manually: <code>MM:SS</code>, <code>MM:SS.mmm</code>,
 <code>HH:MM:SS</code>, or <code>HH:MM:SS.mmm</code>.
 </div>
 """, unsafe_allow_html=True)
 
-# -- Video player with capture buttons -----------------------------------------
-# The buttons live inside the iframe so they have direct access to video.currentTime.
-# They communicate back to Streamlit by setting window.parent.location.search,
-# which Streamlit reads as query params, triggering a rerun that pre-fills the fields.
+# -- Video player with single clipboard copy button ----------------------------
+# The button reads video.currentTime, formats it, and writes it to the clipboard.
+# No Streamlit round-trip needed — the video keeps playing and nothing reloads.
 components.html(
     f"""
     <style>
-        body {{ margin: 0; background: #f0f6ff; font-family: 'IBM Plex Sans', sans-serif; }}
-        video {{ display: block; width: 100%; max-height: 480px; background: #000; }}
+        body {{
+            margin: 0;
+            background: #f0f6ff;
+            font-family: 'IBM Plex Sans', sans-serif;
+        }}
+        video {{
+            display: block;
+            width: 100%;
+            max-height: 480px;
+            background: #000;
+        }}
         .btn-row {{
             display: flex;
-            gap: 10px;
+            align-items: center;
+            gap: 12px;
             margin-top: 10px;
         }}
-        button {{
-            flex: 1;
-            padding: 8px 0;
+        #btn-copy {{
+            padding: 8px 20px;
             font-family: 'IBM Plex Mono', monospace;
             font-size: 0.82rem;
             border-radius: 4px;
             cursor: pointer;
-            border: 1px solid #b6d4ee;
-            transition: background 0.15s;
-        }}
-        #btn-start {{
-            background: #e4f0fb;
-            color: #0f1f3d;
-            border-color: #2a7fc1;
-        }}
-        #btn-start:hover {{ background: #cce3f5; }}
-        #btn-end {{
             background: #2a7fc1;
             color: #ffffff;
-            border-color: #1a6aad;
+            border: 1px solid #1a6aad;
+            transition: background 0.15s;
+            white-space: nowrap;
         }}
-        #btn-end:hover {{ background: #1a6aad; }}
-        .captured {{
-            margin-top: 6px;
+        #btn-copy:hover {{ background: #1a6aad; }}
+        #btn-copy.copied {{
+            background: #238636;
+            border-color: #2ea043;
+        }}
+        #timestamp-display {{
             font-family: 'IBM Plex Mono', monospace;
-            font-size: 0.78rem;
+            font-size: 0.9rem;
+            color: #0f1f3d;
+            background: #e4f0fb;
+            border: 1px solid #b6d4ee;
+            border-radius: 4px;
+            padding: 6px 12px;
+            min-width: 140px;
+            letter-spacing: 0.04em;
+        }}
+        #status {{
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.75rem;
             color: #3d6a99;
+            margin-top: 5px;
             min-height: 1.2em;
         }}
     </style>
@@ -469,35 +460,59 @@ components.html(
     </video>
 
     <div class="btn-row">
-        <button id="btn-start" onclick="capture('start')">
-            &#9654; Capture start time
+        <button id="btn-copy" onclick="copyTime()">
+            &#128203; Copy current time
         </button>
-        <button id="btn-end" onclick="capture('end')">
-            &#9654; Capture end time
-        </button>
+        <span id="timestamp-display">--:--.--.---</span>
     </div>
-    <div class="captured" id="status">Pause the video then click a button to capture the timestamp.</div>
+    <div id="status">Pause the video and click the button to copy the timestamp.</div>
 
     <script>
-        document.getElementById("player").load();
+        var player = document.getElementById("player");
+        var display = document.getElementById("timestamp-display");
 
-        function capture(which) {{
-            var t = document.getElementById("player").currentTime;
-            // Format as HH:MM:SS.mmm
+        // Keep the display updated as video plays
+        player.addEventListener("timeupdate", function() {{
+            display.textContent = formatTime(player.currentTime);
+        }});
+
+        player.load();
+
+        function copyTime() {{
+            var ts = formatTime(player.currentTime);
+            navigator.clipboard.writeText(ts).then(function() {{
+                var btn = document.getElementById("btn-copy");
+                var status = document.getElementById("status");
+                btn.textContent = "Copied!";
+                btn.classList.add("copied");
+                status.textContent = "Copied to clipboard: " + ts + "  — now paste into Start time or End time.";
+                setTimeout(function() {{
+                    btn.innerHTML = "&#128203; Copy current time";
+                    btn.classList.remove("copied");
+                }}, 1500);
+            }}).catch(function() {{
+                // Fallback for browsers that block clipboard without HTTPS
+                var ta = document.createElement("textarea");
+                ta.value = formatTime(player.currentTime);
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand("copy");
+                document.body.removeChild(ta);
+                document.getElementById("status").textContent =
+                    "Copied: " + formatTime(player.currentTime);
+            }});
+        }}
+
+        function formatTime(t) {{
             var ms  = Math.round((t % 1) * 1000);
+            // guard against rounding up to 1000ms
+            if (ms >= 1000) {{ ms = 999; }}
             var s   = Math.floor(t);
             var h   = Math.floor(s / 3600);
             var m   = Math.floor((s % 3600) / 60);
             var sec = s % 60;
-            var ts  = (h > 0 ? pad(h) + ":" : "") +
-                      pad(m) + ":" + pad(sec) + "." + pad3(ms);
-
-            // Show feedback inside the iframe
-            document.getElementById("status").textContent =
-                (which === "start" ? "Start" : "End") + " captured: " + ts;
-
-            // Send to Streamlit via query param — triggers a Python rerun
-            window.parent.location.search = "?capture=" + which + ":" + t.toFixed(3);
+            return (h > 0 ? pad(h) + ":" : "") +
+                   pad(m) + ":" + pad(sec) + "." + pad3(ms);
         }}
 
         function pad(n)  {{ return String(n).padStart(2, "0"); }}
@@ -512,14 +527,6 @@ st.markdown("---")
 
 # -- Add annotation form -------------------------------------------------------
 st.markdown("### Add Phase Annotation")
-
-# Push captured values into the widget keys directly
-if st.session_state.captured_start:
-    st.session_state["start_inp"] = st.session_state.captured_start
-    st.session_state.captured_start = ""
-if st.session_state.captured_end:
-    st.session_state["end_inp"] = st.session_state.captured_end
-    st.session_state.captured_end = ""
 
 col1, col2, col3, col4 = st.columns([2, 2, 3, 3])
 with col1:
@@ -541,14 +548,9 @@ with col4:
         "Notes (optional)", placeholder="Any observations...", key="notes_inp"
     )
 
-add_col, clear_col, _ = st.columns([2, 2, 4])
+add_col, _ = st.columns([2, 6])
 with add_col:
     add_clicked = st.button("Add Phase", type="primary", use_container_width=True)
-with clear_col:
-    if st.button("Clear times", use_container_width=True):
-        st.session_state.captured_start = ""
-        st.session_state.captured_end = ""
-        st.rerun()
 
 if add_clicked:
     start_sec = hms_to_seconds(start_input) if start_input else -1
@@ -569,9 +571,6 @@ if add_clicked:
         })
         annotations.sort(key=lambda x: x["start_sec"])
         save_annotations(video_path, save_dir, annotations)
-        # Clear captures after a successful save
-        st.session_state.captured_start = ""
-        st.session_state.captured_end   = ""
         st.success(
             f"Saved: {phase_select}  "
             f"{seconds_to_hms(start_sec)} to {seconds_to_hms(end_sec)}"
@@ -647,15 +646,11 @@ nav1, nav2, nav3 = st.columns([2, 4, 2])
 with nav1:
     if st.session_state.video_idx > 0:
         if st.button("Previous video", use_container_width=True):
-            st.session_state.captured_start = ""
-            st.session_state.captured_end   = ""
             st.session_state.video_idx -= 1
             st.rerun()
 with nav3:
     if st.session_state.video_idx < len(video_files) - 1:
         if st.button("Next video", type="primary", use_container_width=True):
-            st.session_state.captured_start = ""
-            st.session_state.captured_end   = ""
             st.session_state.video_idx += 1
             st.rerun()
 
