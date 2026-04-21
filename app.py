@@ -3,6 +3,8 @@ import streamlit.components.v1 as components
 import json
 import csv
 import os
+import re
+import mimetypes
 from pathlib import Path
 import threading
 import http.server
@@ -156,14 +158,157 @@ SURGICAL_PHASES = [
 
 # -- Helpers -------------------------------------------------------------------
 
+
+_STREAM_CHUNK = 1024 * 1024
+ 
+_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+ 
+ 
 def start_video_server(directory, port=8765):
-    class Handler(http.server.SimpleHTTPRequestHandler):
+ 
+    class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=directory, **kwargs)
+ 
         def log_message(self, format, *args):
             pass
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("", port), Handler) as httpd:
+ 
+        def _guess_content_type(self, path: str) -> str:
+            ctype, _ = mimetypes.guess_type(path)
+            if ctype:
+                return ctype
+            # Fall back to something the browser will still try to play.
+            ext = Path(path).suffix.lower()
+            return {
+                ".mp4": "video/mp4",
+                ".m4v": "video/mp4",
+                ".mov": "video/quicktime",
+                ".mkv": "video/x-matroska",
+                ".avi": "video/x-msvideo",
+                ".wmv": "video/x-ms-wmv",
+            }.get(ext, "application/octet-stream")
+ 
+        def _parse_range(self, range_header: str, file_size: int):
+            if not range_header:
+                return None
+            m = _RANGE_RE.match(range_header.strip())
+            if not m:
+                return None
+            start_s, end_s = m.group(1), m.group(2)
+            if start_s == "" and end_s == "":
+                return None
+            if start_s == "":
+                # Suffix form: bytes=-N means "last N bytes"
+                length = int(end_s)
+                if length == 0:
+                    return (-1, -1)
+                start = max(0, file_size - length)
+                end = file_size - 1
+            else:
+                start = int(start_s)
+                end = int(end_s) if end_s else file_size - 1
+            if start >= file_size or end >= file_size or start > end:
+                if start >= file_size:
+                    return (-1, -1)
+                end = min(end, file_size - 1)
+            return (start, end)
+ 
+        def do_GET(self):
+            path = self.translate_path(self.path)
+            if not os.path.isfile(path):
+                return super().do_GET()
+ 
+            try:
+                file_size = os.path.getsize(path)
+            except OSError:
+                self.send_error(404, "File not found")
+                return
+ 
+            ctype = self._guess_content_type(path)
+            range_header = self.headers.get("Range")
+            parsed = self._parse_range(range_header, file_size)
+ 
+            if parsed is None:
+                try:
+                    f = open(path, "rb")
+                except OSError:
+                    self.send_error(404, "File not found")
+                    return
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(file_size))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    self._stream_copy(f, file_size)
+                finally:
+                    f.close()
+                return
+ 
+            # Unsatisfiable range -> 416 with the correct Content-Range.
+            if parsed == (-1, -1):
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.send_header("Content-Type", ctype)
+                self.end_headers()
+                return
+ 
+            start, end = parsed
+            length = end - start + 1
+            try:
+                f = open(path, "rb")
+            except OSError:
+                self.send_error(404, "File not found")
+                return
+            try:
+                f.seek(start)
+                self.send_response(206)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(length))
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self._stream_copy(f, length)
+            finally:
+                f.close()
+ 
+        def do_HEAD(self):
+            # Some players probe with HEAD first. Return the same headers a
+            # full GET would produce but with no body.
+            path = self.translate_path(self.path)
+            if not os.path.isfile(path):
+                return super().do_HEAD()
+            try:
+                file_size = os.path.getsize(path)
+            except OSError:
+                self.send_error(404, "File not found")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", self._guess_content_type(path))
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+ 
+        def _stream_copy(self, fileobj, remaining: int):
+            try:
+                while remaining > 0:
+                    chunk = fileobj.read(min(_STREAM_CHUNK, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return
+ 
+    # ThreadingTCPServer so a second range request can be
+    # served while the first one is still streaming
+    class ThreadedServer(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+ 
+    with ThreadedServer(("", port), RangeRequestHandler) as httpd:
         httpd.serve_forever()
 
 
