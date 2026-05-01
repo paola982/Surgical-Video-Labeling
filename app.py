@@ -156,6 +156,8 @@ SURGICAL_PHASES = [
     "Exception",
 ]
 
+#SURGICAL_PHASES = ["Inspection","Mucosal Incision","Deep Dissection","Resection","Final check","Idle","Exception",]
+
 # -- Helpers -------------------------------------------------------------------
 
 
@@ -403,6 +405,13 @@ def export_all_csv(save_dir: str, video_files: list):
 # -- Session state init --------------------------------------------------------
 if "video_idx" not in st.session_state:
     st.session_state.video_idx = 0
+
+if "editing_idx" not in st.session_state:
+    st.session_state.editing_idx = None
+    st.session_state.edit_start = ""
+    st.session_state.edit_end = ""
+    st.session_state.edit_phase = 0
+    st.session_state.edit_notes = ""
 
 # -- Sidebar -------------------------------------------------------------------
 with st.sidebar:
@@ -673,29 +682,49 @@ st.markdown("---")
 # -- Add annotation form -------------------------------------------------------
 st.markdown("### Add Phase Annotation")
 
+is_editing = st.session_state.editing_idx is not None
+
 col1, col2, col3, col4 = st.columns([2, 2, 3, 3])
 with col1:
     start_input = st.text_input(
         "Start time",
+        value=st.session_state.edit_start if is_editing else "",
         placeholder="e.g. 01:23.500",
-        key="start_inp",
+        key=f"start_inp_{st.session_state.editing_idx}",
     )
+
 with col2:
     end_input = st.text_input(
         "End time",
+        value=st.session_state.edit_end if is_editing else "",
         placeholder="e.g. 03:45.000",
-        key="end_inp",
-    )
-with col3:
-    phase_select = st.selectbox("Phase", SURGICAL_PHASES, key="phase_sel")
-with col4:
-    notes_input = st.text_input(
-        "Notes (optional)", placeholder="Any observations...", key="notes_inp"
+        key=f"end_inp_{st.session_state.editing_idx}",
     )
 
-add_col, _ = st.columns([2, 6])
+with col3:
+    phase_select = st.selectbox(
+        "Phase", SURGICAL_PHASES,
+        index=st.session_state.edit_phase if is_editing else 0,
+        key=f"phase_sel_{st.session_state.editing_idx}",
+    )
+
+with col4:
+    notes_input = st.text_input(
+        "Notes (optional)",
+        value=st.session_state.edit_notes if is_editing else "",
+        placeholder="Any observations...",
+        key=f"notes_inp_{st.session_state.editing_idx}",
+    )
+
+add_col, cancel_col, _ = st.columns([2, 2, 4])
 with add_col:
-    add_clicked = st.button("Add Phase", type="primary", use_container_width=True)
+    btn_label = "Update Phase" if is_editing else "Add Phase"
+    add_clicked = st.button(btn_label, type="primary", use_container_width=True)
+with cancel_col:
+    if is_editing:
+        if st.button("Cancel Edit", use_container_width=True):
+            st.session_state.editing_idx = None
+            st.rerun()
 
 if add_clicked:
     start_sec = hms_to_seconds(start_input) if start_input else -1
@@ -708,16 +737,21 @@ if add_clicked:
     elif end_sec <= start_sec:
         st.error("End time must be after start time.")
     else:
-        annotations.append({
+        entry = {
             "phase":     phase_select,
             "start_sec": round(start_sec, 3),
             "end_sec":   round(end_sec,   3),
             "notes":     notes_input.strip(),
-        })
+        }
+        if is_editing:
+            annotations[st.session_state.editing_idx] = entry
+        else:
+            annotations.append(entry)
         annotations.sort(key=lambda x: x["start_sec"])
         save_annotations(video_path, save_dir, annotations)
+        st.session_state.editing_idx = None
         st.success(
-            f"Saved: {phase_select}  "
+            f"{'Updated' if is_editing else 'Saved'}: {phase_select}  "
             f"{seconds_to_hms(start_sec)} to {seconds_to_hms(end_sec)}"
         )
         st.rerun()
@@ -735,8 +769,8 @@ if not annotations:
         unsafe_allow_html=True,
     )
 else:
-    hcols = st.columns([1, 2, 2, 3, 4, 1])
-    for col, label in zip(hcols, ["#", "Start", "End", "Duration", "Phase", "Del"]):
+    hcols = st.columns([1, 2, 2, 3, 4, 1, 2])
+    for col, label in zip(hcols, ["#", "Start", "End", "Duration", "Phase", "Del", "Edit"]):
         col.markdown(
             f'<div style="color:#5a7fa8;font-size:0.72rem;text-transform:uppercase;'
             f'letter-spacing:0.08em;font-family:\'IBM Plex Mono\','
@@ -746,7 +780,7 @@ else:
 
     for i, ann in enumerate(annotations):
         dur = ann["end_sec"] - ann["start_sec"]
-        c1, c2, c3, c4, c5, c6 = st.columns([1, 2, 2, 3, 4, 1])
+        c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 2, 2, 3, 4, 1, 2])
         c1.markdown(
             f'<div style="font-family:\'IBM Plex Mono\',monospace;'
             f'font-size:0.82rem;color:#5a7fa8">{i+1}</div>',
@@ -783,6 +817,14 @@ else:
         if c6.button("x", key=f"del_{i}", help="Delete this annotation"):
             annotations.pop(i)
             save_annotations(video_path, save_dir, annotations)
+            st.rerun()
+
+        if c7.button("Edit", key=f"edit_{i}", help="Edit this annotation"):
+            st.session_state.editing_idx = i
+            st.session_state.edit_start = seconds_to_hms(ann["start_sec"])
+            st.session_state.edit_end = seconds_to_hms(ann["end_sec"])
+            st.session_state.edit_phase = SURGICAL_PHASES.index(ann["phase"])
+            st.session_state.edit_notes = ann.get("notes", "")
             st.rerun()
 
 # -- Navigation ----------------------------------------------------------------
